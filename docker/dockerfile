@@ -114,13 +114,9 @@ ARG PLATFORM=debian
 ARG FILE=$PLATFORM-$TARGETARCH-$VERSION.tar.gz
 ARG DIST=dist.tar.gz
 
-RUN chmod +x /app/extra/upload-github-release-asset.sh
-
-# Full Build
-# RUN tar -zcvf $FILE app
-# RUN /app/extra/upload-github-release-asset.sh github_api_token=$GITHUB_TOKEN owner=louislam repo=uptime-kuma tag=$VERSION filename=$FILE
-
-# Dist only
-RUN cd /app && tar -zcvf $DIST dist
-RUN /app/extra/upload-github-release-asset.sh github_api_token=$GITHUB_TOKEN owner=louislam repo=uptime-kuma tag=$VERSION filename=/app/$DIST
+# Upload steps removed - this target is kept for compatibility but does nothing by default
+# To use this target, uncomment the lines below and provide GITHUB_TOKEN and VERSION build args
+# RUN chmod +x /app/extra/upload-github-release-asset.sh
+# RUN cd /app && tar -zcvf $DIST dist
+# RUN /app/extra/upload-github-release-asset.sh github_api_token=$GITHUB_TOKEN owner=louislam repo=uptime-kuma tag=$VERSION filename=/app/$DIST
 
