@@ -1223,6 +1223,58 @@ class Monitor extends BeanModel {
     }
 
     /**
+     * Send statistics for multiple monitors in batch (optimized for many monitors)
+     * @param {Server} io Socket server instance
+     * @param {Array<number>} monitorIDs Array of monitor IDs to send stats for
+     * @param {number} userID ID of user to send to
+     * @returns {Promise<void>}
+     */
+    static async batchSendStats(io, monitorIDs, userID) {
+        const hasClients = getTotalClientInRoom(io, userID) > 0;
+        if (!hasClients || monitorIDs.length === 0) {
+            return;
+        }
+
+        // Calculate stats for all monitors in parallel
+        const statsPromises = monitorIDs.map(async (monitorID) => {
+            try {
+                const uptimeCalculator = await UptimeCalculator.getUptimeCalculator(monitorID);
+                const [data24h, data30d, data1y] = await Promise.all([
+                    uptimeCalculator.get24Hour(),
+                    uptimeCalculator.get30Day(),
+                    uptimeCalculator.get1Year()
+                ]);
+
+                return {
+                    monitorID,
+                    avgPing: data24h.avgPing ? Number(data24h.avgPing.toFixed(2)) : null,
+                    uptime24h: data24h.uptime,
+                    uptime30d: data30d.uptime,
+                    uptime1y: data1y.uptime
+                };
+            } catch (e) {
+                log.error("monitor", `Error calculating stats for monitor ${monitorID}: ${e.message}`);
+                return {
+                    monitorID,
+                    avgPing: null,
+                    uptime24h: null,
+                    uptime30d: null,
+                    uptime1y: null
+                };
+            }
+        });
+
+        const allStats = await Promise.all(statsPromises);
+
+        // Send as batch event
+        io.to(userID).emit("batchStats", allStats);
+
+        // Send cert info separately (can be done in parallel but keeping it separate for now)
+        const certPromises = monitorIDs.map(monitorID => Monitor.sendCertInfo(io, monitorID, userID));
+        await Promise.allSettled(certPromises);
+    }
+
+    /**
      * Send certificate information to client
      * @param {Server} io Socket server instance
      * @param {number} monitorID ID of monitor to send
@@ -1572,11 +1624,15 @@ class Monitor extends BeanModel {
             const monitorIDs = monitorData.map(monitor => monitor.id);
             const notifications = await Monitor.getMonitorNotification(monitorIDs);
             const tags = await Monitor.getMonitorTag(monitorIDs);
-            const maintenanceStatuses = await Promise.all(monitorData.map(monitor => Monitor.isUnderMaintenance(monitor.id)));
-            const childrenIDs = await Promise.all(monitorData.map(monitor => Monitor.getAllChildrenIDs(monitor.id)));
-            const activeStatuses = await Promise.all(monitorData.map(monitor => Monitor.isActive(monitor.id, monitor.active)));
-            const forceInactiveStatuses = await Promise.all(monitorData.map(monitor => Monitor.isParentActive(monitor.id)));
-            const paths = await Promise.all(monitorData.map(monitor => Monitor.getAllPath(monitor.id, monitor.name)));
+            
+            // Optimized batch queries for better performance with many monitors
+            const [maintenanceStatuses, childrenIDs, activeStatuses, forceInactiveStatuses, paths] = await Promise.all([
+                Monitor.batchIsUnderMaintenance(monitorIDs),
+                Monitor.batchGetAllChildrenIDs(monitorIDs),
+                Monitor.batchIsActive(monitorData),
+                Monitor.batchIsParentActive(monitorIDs),
+                Monitor.batchGetAllPath(monitorData)
+            ]);
 
             notifications.forEach(row => {
                 if (!notificationsMap.has(row.monitor_id)) {
@@ -1598,25 +1654,14 @@ class Monitor extends BeanModel {
                 });
             });
 
-            monitorData.forEach((monitor, index) => {
-                maintenanceStatusMap.set(monitor.id, maintenanceStatuses[index]);
-            });
-
-            monitorData.forEach((monitor, index) => {
-                childrenIDsMap.set(monitor.id, childrenIDs[index]);
-            });
-
-            monitorData.forEach((monitor, index) => {
-                activeStatusMap.set(monitor.id, activeStatuses[index]);
-            });
-
-            monitorData.forEach((monitor, index) => {
-                forceInactiveMap.set(monitor.id, !forceInactiveStatuses[index]);
-            });
-
-            monitorData.forEach((monitor, index) => {
-                pathsMap.set(monitor.id, paths[index]);
-            });
+            // Map batch results to individual monitors
+            for (const monitor of monitorData) {
+                maintenanceStatusMap.set(monitor.id, maintenanceStatuses.get(monitor.id) || false);
+                childrenIDsMap.set(monitor.id, childrenIDs.get(monitor.id) || []);
+                activeStatusMap.set(monitor.id, activeStatuses.get(monitor.id) || false);
+                forceInactiveMap.set(monitor.id, !(forceInactiveStatuses.get(monitor.id) || false));
+                pathsMap.set(monitor.id, paths.get(monitor.id) || []);
+            }
         }
 
         return {
@@ -1628,6 +1673,282 @@ class Monitor extends BeanModel {
             forceInactive: forceInactiveMap,
             paths: pathsMap,
         };
+    }
+
+    /**
+     * Batch version of isUnderMaintenance for multiple monitors
+     * @param {Array<number>} monitorIDs Array of monitor IDs
+     * @returns {Promise<Map<number, boolean>>} Map of monitor ID to maintenance status
+     */
+    static async batchIsUnderMaintenance(monitorIDs) {
+        if (monitorIDs.length === 0) {
+            return new Map();
+        }
+
+        const result = new Map();
+        const server = UptimeKumaServer.getInstance();
+
+        // Get all maintenance relationships in one query
+        const maintenanceRelations = await R.getAll(`
+            SELECT monitor_id, maintenance_id FROM monitor_maintenance
+            WHERE monitor_id IN (${monitorIDs.map(() => "?").join(",")})
+        `, monitorIDs);
+
+        // Group by monitor_id
+        const monitorMaintenances = new Map();
+        for (const rel of maintenanceRelations) {
+            if (!monitorMaintenances.has(rel.monitor_id)) {
+                monitorMaintenances.set(rel.monitor_id, []);
+            }
+            monitorMaintenances.get(rel.monitor_id).push(rel.maintenance_id);
+        }
+
+        // Get all parent relationships in one query
+        const parentRelations = await R.getAll(`
+            SELECT id, parent FROM monitor
+            WHERE id IN (${monitorIDs.map(() => "?").join(",")})
+        `, monitorIDs);
+
+        const parentMap = new Map();
+        for (const rel of parentRelations) {
+            parentMap.set(rel.id, rel.parent);
+        }
+
+        // Check maintenance status for each monitor
+        for (const monitorID of monitorIDs) {
+            let isUnderMaintenance = false;
+            const maintenanceIDs = monitorMaintenances.get(monitorID) || [];
+            
+            for (const maintenanceID of maintenanceIDs) {
+                const maintenance = server.getMaintenance(maintenanceID);
+                if (maintenance && await maintenance.isUnderMaintenance()) {
+                    isUnderMaintenance = true;
+                    break;
+                }
+            }
+
+            // Check parent maintenance status recursively
+            if (!isUnderMaintenance) {
+                let currentID = monitorID;
+                while (currentID !== null && parentMap.has(currentID)) {
+                    const parentID = parentMap.get(currentID);
+                    if (parentID === null) {
+                        break;
+                    }
+                    const parentMaintenanceIDs = monitorMaintenances.get(parentID) || [];
+                    for (const maintenanceID of parentMaintenanceIDs) {
+                        const maintenance = server.getMaintenance(maintenanceID);
+                        if (maintenance && await maintenance.isUnderMaintenance()) {
+                            isUnderMaintenance = true;
+                            break;
+                        }
+                    }
+                    if (isUnderMaintenance) {
+                        break;
+                    }
+                    currentID = parentID;
+                }
+            }
+
+            result.set(monitorID, isUnderMaintenance);
+        }
+
+        return result;
+    }
+
+    /**
+     * Batch version of getAllChildrenIDs for multiple monitors
+     * @param {Array<number>} monitorIDs Array of monitor IDs
+     * @returns {Promise<Map<number, Array<number>>>} Map of monitor ID to children IDs
+     */
+    static async batchGetAllChildrenIDs(monitorIDs) {
+        if (monitorIDs.length === 0) {
+            return new Map();
+        }
+
+        const result = new Map();
+        
+        // Get all parent-child relationships in one query
+        const allMonitors = await R.getAll(`
+            SELECT id, parent FROM monitor
+            WHERE parent IN (${monitorIDs.map(() => "?").join(",")}) OR id IN (${monitorIDs.map(() => "?").join(",")})
+        `, [...monitorIDs, ...monitorIDs]);
+
+        // Build parent-child map
+        const childrenMap = new Map();
+        const parentMap = new Map();
+        
+        for (const monitor of allMonitors) {
+            if (monitor.parent !== null) {
+                if (!childrenMap.has(monitor.parent)) {
+                    childrenMap.set(monitor.parent, []);
+                }
+                childrenMap.get(monitor.parent).push(monitor.id);
+            }
+            parentMap.set(monitor.id, monitor.parent);
+        }
+
+        // Recursively get all children for each monitor
+        const getAllChildrenRecursive = (monitorID) => {
+            const directChildren = childrenMap.get(monitorID) || [];
+            let allChildren = [...directChildren];
+            for (const childID of directChildren) {
+                allChildren = allChildren.concat(getAllChildrenRecursive(childID));
+            }
+            return allChildren;
+        };
+
+        for (const monitorID of monitorIDs) {
+            result.set(monitorID, getAllChildrenRecursive(monitorID));
+        }
+
+        return result;
+    }
+
+    /**
+     * Batch version of isActive for multiple monitors
+     * @param {Array<object>} monitorData Array of {id, active} objects
+     * @returns {Promise<Map<number, boolean>>} Map of monitor ID to active status
+     */
+    static async batchIsActive(monitorData) {
+        if (monitorData.length === 0) {
+            return new Map();
+        }
+
+        const monitorIDs = monitorData.map(m => m.id);
+        const parentActiveMap = await Monitor.batchIsParentActive(monitorIDs);
+        const result = new Map();
+
+        for (const monitor of monitorData) {
+            result.set(monitor.id, (monitor.active === 1) && parentActiveMap.get(monitor.id));
+        }
+
+        return result;
+    }
+
+    /**
+     * Batch version of isParentActive for multiple monitors
+     * @param {Array<number>} monitorIDs Array of monitor IDs
+     * @returns {Promise<Map<number, boolean>>} Map of monitor ID to parent active status
+     */
+    static async batchIsParentActive(monitorIDs) {
+        if (monitorIDs.length === 0) {
+            return new Map();
+        }
+
+        const result = new Map();
+        
+        // Get all parent relationships and active status in one query
+        const monitors = await R.getAll(`
+            SELECT id, parent, active FROM monitor
+            WHERE id IN (${monitorIDs.map(() => "?").join(",")})
+        `, monitorIDs);
+
+        const monitorMap = new Map();
+        const parentMap = new Map();
+        
+        for (const monitor of monitors) {
+            monitorMap.set(monitor.id, monitor);
+            parentMap.set(monitor.id, monitor.parent);
+        }
+
+        // Recursively check parent active status
+        const checkParentActive = (monitorID) => {
+            const parentID = parentMap.get(monitorID);
+            if (parentID === null) {
+                return true;
+            }
+            const parent = monitorMap.get(parentID);
+            if (!parent) {
+                return true; // Parent not in this batch, assume active
+            }
+            if (parent.active !== 1) {
+                return false;
+            }
+            return checkParentActive(parentID);
+        };
+
+        for (const monitorID of monitorIDs) {
+            result.set(monitorID, checkParentActive(monitorID));
+        }
+
+        return result;
+    }
+
+    /**
+     * Batch version of getAllPath for multiple monitors
+     * @param {Array<object>} monitorData Array of {id, name} objects
+     * @returns {Promise<Map<number, Array<string>>>} Map of monitor ID to path array
+     */
+    static async batchGetAllPath(monitorData) {
+        if (monitorData.length === 0) {
+            return new Map();
+        }
+
+        const monitorIDs = monitorData.map(m => m.id);
+        const result = new Map();
+
+        // Get all monitors with their parent relationships (including all parents recursively)
+        // First, get all direct monitors
+        let allMonitors = await R.getAll(`
+            SELECT id, parent, name FROM monitor
+            WHERE id IN (${monitorIDs.map(() => "?").join(",")})
+        `, monitorIDs);
+
+        const monitorMap = new Map();
+        const parentMap = new Map();
+        const fetchedParentIDs = new Set();
+        
+        for (const monitor of allMonitors) {
+            monitorMap.set(monitor.id, monitor);
+            parentMap.set(monitor.id, monitor.parent);
+            if (monitor.parent !== null) {
+                fetchedParentIDs.add(monitor.parent);
+            }
+        }
+
+        // Fetch all parents recursively in batches
+        let parentIDsToFetch = Array.from(fetchedParentIDs).filter(id => !monitorMap.has(id));
+        while (parentIDsToFetch.length > 0) {
+            const parentBatch = await R.getAll(`
+                SELECT id, parent, name FROM monitor
+                WHERE id IN (${parentIDsToFetch.map(() => "?").join(",")})
+            `, parentIDsToFetch);
+
+            const nextParentIDs = new Set();
+            for (const monitor of parentBatch) {
+                monitorMap.set(monitor.id, monitor);
+                parentMap.set(monitor.id, monitor.parent);
+                if (monitor.parent !== null && !monitorMap.has(monitor.parent)) {
+                    nextParentIDs.add(monitor.parent);
+                }
+            }
+            parentIDsToFetch = Array.from(nextParentIDs);
+        }
+
+        // Build paths for each monitor
+        for (const monitor of monitorData) {
+            const path = [monitor.name];
+            let currentID = monitor.id;
+            
+            while (currentID !== null && parentMap.has(currentID)) {
+                const parentID = parentMap.get(currentID);
+                if (parentID === null) {
+                    break;
+                }
+                const parent = monitorMap.get(parentID);
+                if (parent) {
+                    path.unshift(parent.name);
+                    currentID = parentID;
+                } else {
+                    break;
+                }
+            }
+            
+            result.set(monitor.id, path);
+        }
+
+        return result;
     }
 
     /**

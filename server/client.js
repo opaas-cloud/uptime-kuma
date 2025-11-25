@@ -65,6 +65,59 @@ async function sendHeartbeatList(socket, monitorID, toUser = false, overwrite = 
 }
 
 /**
+ * Send Heartbeat History list for multiple monitors in batch (optimized for many monitors)
+ * @param {Socket} socket Socket.io instance
+ * @param {Array<number>} monitorIDs Array of monitor IDs to send heartbeat history
+ * @param {boolean} toUser  True = send to all browsers with the same user id, False = send to the current browser only
+ * @param {boolean} overwrite Overwrite client-side's heartbeat list
+ * @param {number} limit Number of heartbeats per monitor (default: 10 for initial load)
+ * @returns {Promise<void>}
+ */
+async function sendBatchHeartbeatList(socket, monitorIDs, toUser = false, overwrite = false, limit = 10) {
+    if (monitorIDs.length === 0) {
+        return;
+    }
+
+    // For SQLite compatibility, we'll query all heartbeats and group them in JavaScript
+    // This is still more efficient than individual queries for many monitors
+    const allHeartbeats = await R.getAll(`
+        SELECT * FROM heartbeat
+        WHERE monitor_id IN (${monitorIDs.map(() => "?").join(",")})
+        ORDER BY monitor_id, time DESC
+    `, monitorIDs);
+
+    // Group heartbeats by monitor_id and limit to N per monitor
+    const grouped = {};
+    const monitorCounts = {};
+    
+    for (const beat of allHeartbeats) {
+        const monitorID = beat.monitor_id;
+        
+        if (!grouped[monitorID]) {
+            grouped[monitorID] = [];
+            monitorCounts[monitorID] = 0;
+        }
+        
+        if (monitorCounts[monitorID] < limit) {
+            grouped[monitorID].push(beat);
+            monitorCounts[monitorID]++;
+        }
+    }
+
+    // Reverse each array to get chronological order (oldest first)
+    for (const monitorID in grouped) {
+        grouped[monitorID].reverse();
+    }
+
+    // Send as batch event for better performance
+    if (toUser) {
+        io.to(socket.userID).emit("batchHeartbeatList", grouped, overwrite);
+    } else {
+        socket.emit("batchHeartbeatList", grouped, overwrite);
+    }
+}
+
+/**
  * Important Heart beat list (aka event list)
  * @param {Socket} socket Socket.io instance
  * @param {number} monitorID ID of monitor to send heartbeat history
@@ -243,6 +296,7 @@ module.exports = {
     sendNotificationList,
     sendImportantHeartbeatList,
     sendHeartbeatList,
+    sendBatchHeartbeatList,
     sendProxyList,
     sendAPIKeyList,
     sendInfo,

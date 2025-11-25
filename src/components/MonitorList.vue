@@ -45,22 +45,51 @@
                 </span>
             </div>
         </div>
-        <div ref="monitorList" class="monitor-list" :class="{ scrollbar: scrollbar }" :style="monitorListStyle" data-testid="monitor-list">
+        <div 
+            ref="monitorList" 
+            class="monitor-list" 
+            :class="{ scrollbar: scrollbar }" 
+            :style="monitorListStyle" 
+            data-testid="monitor-list"
+            @scroll="onListScroll"
+        >
             <div v-if="Object.keys($root.monitorList).length === 0" class="text-center mt-3">
                 {{ $t("No Monitors, please") }} <router-link to="/add">{{ $t("add one") }}</router-link>
             </div>
 
-            <MonitorListItem
-                v-for="(item, index) in sortedMonitorList"
-                :key="index"
-                :monitor="item"
-                :isSelectMode="selectMode"
-                :isSelected="isSelected"
-                :select="select"
-                :deselect="deselect"
-                :filter-func="filterFunc"
-                :sort-func="sortFunc"
-            />
+            <!-- Virtual scrolling container (only for many monitors) -->
+            <template v-if="shouldUseVirtualScrolling && sortedMonitorList.length > 0">
+                <div class="virtual-scroll-container" :style="{ height: totalListHeight + 'px', position: 'relative' }">
+                    <div class="virtual-scroll-content" :style="{ transform: `translateY(${listOffset}px)` }">
+                        <MonitorListItem
+                            v-for="(item, index) in visibleMonitorList"
+                            :key="item.id"
+                            :monitor="item"
+                            :isSelectMode="selectMode"
+                            :isSelected="isSelected"
+                            :select="select"
+                            :deselect="deselect"
+                            :filter-func="filterFunc"
+                            :sort-func="sortFunc"
+                        />
+                    </div>
+                </div>
+            </template>
+            
+            <!-- Normal rendering for smaller lists -->
+            <template v-else>
+                <MonitorListItem
+                    v-for="(item, index) in sortedMonitorList"
+                    :key="item.id"
+                    :monitor="item"
+                    :isSelectMode="selectMode"
+                    :isSelected="isSelected"
+                    :select="select"
+                    :deselect="deselect"
+                    :filter-func="filterFunc"
+                    :sort-func="sortFunc"
+                />
+            </template>
         </div>
     </div>
 
@@ -90,6 +119,8 @@ export default {
     data() {
         return {
             searchText: "",
+            debouncedSearchText: "",
+            searchDebounceTimer: null,
             selectMode: false,
             selectAll: false,
             disableSelectAllWatcher: false,
@@ -99,7 +130,16 @@ export default {
                 status: null,
                 active: null,
                 tags: null,
-            }
+            },
+            // Virtual scrolling
+            scrollTop: 0,
+            itemHeight: 60, // Approximate height of each monitor item
+            visibleItemCount: 20, // Number of items to render
+            overscan: 5, // Extra items to render above/below viewport
+            useVirtualScrolling: false, // Enable when there are many monitors
+            // Cache for filter results
+            _filterCache: new Map(),
+            _filterCacheKey: null,
         };
     },
     computed: {
@@ -137,11 +177,93 @@ export default {
                 return true;
             });
 
+            // Create cache key based on filter state and search text
+            const cacheKey = JSON.stringify({
+                status: this.filterState.status,
+                active: this.filterState.active,
+                tags: this.filterState.tags,
+                searchText: this.debouncedSearchText || this.searchText,
+                monitorCount: result.length
+            });
+
+            // Check cache
+            if (this._filterCacheKey === cacheKey && this._filterCache.has(cacheKey)) {
+                return this._filterCache.get(cacheKey);
+            }
+
             result = result.filter(this.filterFunc);
 
             result.sort(this.sortFunc);
 
+            // Cache the result (limit cache size to prevent memory issues)
+            if (this._filterCache.size > 10) {
+                this._filterCache.clear();
+            }
+            this._filterCache.set(cacheKey, result);
+            this._filterCacheKey = cacheKey;
+
             return result;
+        },
+
+        /**
+         * Calculate visible range for virtual scrolling
+         * @returns {object} Object with start and end indices
+         */
+        visibleRange() {
+            const totalItems = this.sortedMonitorList.length;
+            if (totalItems === 0) {
+                return { start: 0, end: 0 };
+            }
+
+            let containerHeight = 600; // Default height
+            if (this.$refs.monitorList) {
+                containerHeight = this.$refs.monitorList.clientHeight;
+            } else if (this.monitorListStyle.height) {
+                const heightStr = this.monitorListStyle.height;
+                containerHeight = parseInt(heightStr.replace("px", "").replace("calc(", "").replace(")", "")) || 600;
+            }
+
+            const startIndex = Math.max(0, Math.floor(this.scrollTop / this.itemHeight) - this.overscan);
+            const endIndex = Math.min(
+                totalItems,
+                startIndex + Math.ceil(containerHeight / this.itemHeight) + this.overscan * 2
+            );
+
+            return { start: startIndex, end: endIndex };
+        },
+
+        /**
+         * Get visible monitors for virtual scrolling
+         * @returns {Array} Visible monitors
+         */
+        visibleMonitorList() {
+            const { start, end } = this.visibleRange;
+            return this.sortedMonitorList.slice(start, end);
+        },
+
+        /**
+         * Calculate offset for virtual scrolling
+         * @returns {number} Offset in pixels
+         */
+        listOffset() {
+            return this.visibleRange.start * this.itemHeight;
+        },
+
+        /**
+         * Calculate total height of the list
+         * @returns {number} Total height in pixels
+         */
+        totalListHeight() {
+            return this.sortedMonitorList.length * this.itemHeight;
+        },
+        
+        /**
+         * Determine if virtual scrolling should be used
+         * @returns {boolean} True if virtual scrolling should be enabled
+         */
+        shouldUseVirtualScrolling() {
+            // Enable virtual scrolling for more than 100 monitors
+            return this.sortedMonitorList.length > 100;
         },
 
         isDarkTheme() {
@@ -173,7 +295,15 @@ export default {
         }
     },
     watch: {
-        searchText() {
+        searchText(newVal) {
+            // Debounce search text
+            if (this.searchDebounceTimer) {
+                clearTimeout(this.searchDebounceTimer);
+            }
+            this.searchDebounceTimer = setTimeout(() => {
+                this.debouncedSearchText = newVal;
+            }, 300);
+
             for (let monitor of this.sortedMonitorList) {
                 if (!this.selectedMonitors[monitor.id]) {
                     if (this.selectAll) {
@@ -183,6 +313,9 @@ export default {
                     break;
                 }
             }
+        },
+        debouncedSearchText() {
+            // Trigger re-filter when debounced search text changes
         },
         selectAll() {
             if (!this.disableSelectAllWatcher) {
@@ -206,9 +339,16 @@ export default {
     },
     mounted() {
         window.addEventListener("scroll", this.onScroll);
+        // Initialize scroll position
+        if (this.$refs.monitorList) {
+            this.scrollTop = this.$refs.monitorList.scrollTop;
+        }
     },
     beforeUnmount() {
         window.removeEventListener("scroll", this.onScroll);
+        if (this.searchDebounceTimer) {
+            clearTimeout(this.searchDebounceTimer);
+        }
     },
     methods: {
         /**
@@ -220,6 +360,16 @@ export default {
                 this.windowTop = window.top.scrollY;
             } else {
                 this.windowTop = 133;
+            }
+        },
+        /**
+         * Handle scroll in monitor list for virtual scrolling
+         * @param {Event} event Scroll event
+         * @returns {void}
+         */
+        onListScroll(event) {
+            if (this.$refs.monitorList) {
+                this.scrollTop = this.$refs.monitorList.scrollTop;
             }
         },
         /**
@@ -323,8 +473,9 @@ export default {
             // filter by search text
             // finds monitor name, tag name or tag value
             let searchTextMatch = true;
-            if (this.searchText !== "") {
-                const loweredSearchText = this.searchText.toLowerCase();
+            const searchText = this.debouncedSearchText || this.searchText;
+            if (searchText !== "") {
+                const loweredSearchText = searchText.toLowerCase();
                 searchTextMatch =
                     monitor.name.toLowerCase().includes(loweredSearchText)
                     || monitor.tags.find(tag => tag.name.toLowerCase().includes(loweredSearchText)
@@ -481,5 +632,16 @@ export default {
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.virtual-scroll-container {
+    overflow: hidden;
+}
+
+.virtual-scroll-content {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
 }
 </style>

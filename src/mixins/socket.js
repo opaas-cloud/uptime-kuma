@@ -44,6 +44,8 @@ export default {
             heartbeatList: { },
             avgPingList: { },
             uptimeList: { },
+            _heartbeatListVersion: 0,
+            _lastHeartbeatListCache: null,
             tlsInfoList: {},
             notificationList: [],
             dockerHostList: [],
@@ -208,6 +210,9 @@ export default {
                     this.heartbeatList[data.monitorID].shift();
                 }
 
+                // Invalidate cache
+                this._heartbeatListVersion = (this._heartbeatListVersion || 0) + 1;
+
                 // Add to important list if it is important
                 // Also toast
                 if (data.important) {
@@ -236,10 +241,43 @@ export default {
                 } else {
                     this.heartbeatList[monitorID] = data.concat(this.heartbeatList[monitorID]);
                 }
+                // Invalidate cache
+                this._heartbeatListVersion = (this._heartbeatListVersion || 0) + 1;
+            });
+
+            // Batch heartbeat list handler for better performance
+            socket.on("batchHeartbeatList", (data, overwrite = false) => {
+                for (const monitorID in data) {
+                    if (! (monitorID in this.heartbeatList) || overwrite) {
+                        this.heartbeatList[monitorID] = data[monitorID];
+                    } else {
+                        this.heartbeatList[monitorID] = data[monitorID].concat(this.heartbeatList[monitorID]);
+                    }
+                }
+                // Invalidate cache
+                this._heartbeatListVersion = (this._heartbeatListVersion || 0) + 1;
             });
 
             socket.on("avgPing", (monitorID, data) => {
                 this.avgPingList[monitorID] = data;
+            });
+
+            // Batch stats handler for better performance
+            socket.on("batchStats", (statsArray) => {
+                for (const stat of statsArray) {
+                    if (stat.avgPing !== null && stat.avgPing !== undefined) {
+                        this.avgPingList[stat.monitorID] = stat.avgPing;
+                    }
+                    if (stat.uptime24h !== null && stat.uptime24h !== undefined) {
+                        this.uptimeList[`${stat.monitorID}_24`] = stat.uptime24h;
+                    }
+                    if (stat.uptime30d !== null && stat.uptime30d !== undefined) {
+                        this.uptimeList[`${stat.monitorID}_720`] = stat.uptime30d;
+                    }
+                    if (stat.uptime1y !== null && stat.uptime1y !== undefined) {
+                        this.uptimeList[`${stat.monitorID}_1y`] = stat.uptime1y;
+                    }
+                }
             });
 
             socket.on("uptime", (monitorID, type, data) => {
@@ -724,12 +762,26 @@ export default {
         },
 
         lastHeartbeatList() {
+            // Cache the result and only recalculate when heartbeatList changes
+            const currentVersion = this._heartbeatListVersion || 0;
+            if (this._lastHeartbeatListCache && this._lastHeartbeatListCache.version === currentVersion) {
+                return this._lastHeartbeatListCache.data;
+            }
+
             let result = {};
 
             for (let monitorID in this.heartbeatList) {
-                let index = this.heartbeatList[monitorID].length - 1;
-                result[monitorID] = this.heartbeatList[monitorID][index];
+                const beats = this.heartbeatList[monitorID];
+                if (beats && beats.length > 0) {
+                    result[monitorID] = beats[beats.length - 1];
+                }
             }
+
+            // Cache the result
+            this._lastHeartbeatListCache = {
+                version: currentVersion,
+                data: result
+            };
 
             return result;
         },

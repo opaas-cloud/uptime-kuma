@@ -36,13 +36,13 @@
                         </div>
                     </div>
                     <div v-show="$root.userHeartbeatBar == 'normal'" :key="$root.userHeartbeatBar" class="col-6">
-                        <HeartbeatBar ref="heartbeatBar" size="small" :monitor-id="monitor.id" />
+                        <HeartbeatBar v-if="shouldLoadHeartbeatBar" ref="heartbeatBar" size="small" :monitor-id="monitor.id" />
                     </div>
                 </div>
 
                 <div v-if="$root.userHeartbeatBar == 'bottom'" class="row">
                     <div class="col-12 bottom-style">
-                        <HeartbeatBar ref="heartbeatBar" size="small" :monitor-id="monitor.id" />
+                        <HeartbeatBar v-if="shouldLoadHeartbeatBar" ref="heartbeatBar" size="small" :monitor-id="monitor.id" />
                     </div>
                 </div>
             </router-link>
@@ -126,6 +126,8 @@ export default {
         return {
             isCollapsed: true,
             dragOverCount: 0,
+            shouldLoadHeartbeatBar: false,
+            intersectionObserver: null,
         };
     },
     computed: {
@@ -177,6 +179,35 @@ export default {
         }
 
         this.isCollapsed = storageObject[`monitor_${this.monitor.id}`];
+    },
+    mounted() {
+        // Lazy load HeartbeatBar when item becomes visible
+        if (this.$root.userHeartbeatBar !== "none" && "IntersectionObserver" in window) {
+            this.intersectionObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        this.shouldLoadHeartbeatBar = true;
+                        if (this.intersectionObserver) {
+                            this.intersectionObserver.disconnect();
+                        }
+                    }
+                });
+            }, {
+                rootMargin: "50px" // Start loading 50px before item is visible
+            });
+
+            if (this.$el) {
+                this.intersectionObserver.observe(this.$el);
+            }
+        } else {
+            // Fallback: load immediately if IntersectionObserver is not available
+            this.shouldLoadHeartbeatBar = true;
+        }
+    },
+    beforeUnmount() {
+        if (this.intersectionObserver) {
+            this.intersectionObserver.disconnect();
+        }
     },
     methods: {
         /**

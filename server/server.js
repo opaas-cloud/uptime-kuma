@@ -135,7 +135,7 @@ const twoFAVerifyOptions = {
 const testMode = !!args["test"] || false;
 
 // Must be after io instantiation
-const { sendNotificationList, sendHeartbeatList, sendInfo, sendProxyList, sendDockerHostList, sendAPIKeyList, sendRemoteBrowserList, sendMonitorTypeList } = require("./client");
+const { sendNotificationList, sendHeartbeatList, sendBatchHeartbeatList, sendInfo, sendProxyList, sendDockerHostList, sendAPIKeyList, sendRemoteBrowserList, sendMonitorTypeList } = require("./client");
 const { statusPageSocketHandler } = require("./socket-handlers/status-page-socket-handler");
 const { databaseSocketHandler } = require("./socket-handlers/database-socket-handler");
 const { remoteBrowserSocketHandler } = require("./socket-handlers/remote-browser-socket-handler");
@@ -1762,13 +1762,24 @@ async function afterLogin(socket, user) {
 
     await StatusPage.sendStatusPageList(io, socket);
 
-    const monitorPromises = [];
-    for (let monitorID in monitorList) {
-        monitorPromises.push(sendHeartbeatList(socket, monitorID));
-        monitorPromises.push(Monitor.sendStats(io, monitorID, user.id));
+    // Optimized batch loading for many monitors
+    const monitorIDs = Object.keys(monitorList).map(id => parseInt(id));
+    
+    if (monitorIDs.length > 10) {
+        // Use batch loading for better performance with many monitors
+        await Promise.all([
+            sendBatchHeartbeatList(socket, monitorIDs, false, false, 10), // Load only 10 heartbeats initially
+            Monitor.batchSendStats(io, monitorIDs, user.id)
+        ]);
+    } else {
+        // Use individual loading for small numbers of monitors (backward compatibility)
+        const monitorPromises = [];
+        for (let monitorID in monitorList) {
+            monitorPromises.push(sendHeartbeatList(socket, monitorID));
+            monitorPromises.push(Monitor.sendStats(io, monitorID, user.id));
+        }
+        await Promise.all(monitorPromises);
     }
-
-    await Promise.all(monitorPromises);
 
     // Set server timezone from client browser if not set
     // It should be run once only
